@@ -1,0 +1,20 @@
+@@ -147,13 +147,15 @@
+ 
+        my $this = +{};
+        bless $this, $pkgname;
+-       my $col = &Graphics::ColorObject::namecolor($opts[0]);
+-       if ($col)
+-       {
+-               shift(@opts);
+-               $this = new_RGB($pkgname, $col, @opts);
+-               return $this;
+-       }
++    if (@opts) { 
++        my $col = &Graphics::ColorObject::namecolor($opts[0]);
++        if ($col)
++        {
++            shift(@opts);
++            $this = new_RGB($pkgname, $col, @opts);
++            return $this;
++        }
++    }
