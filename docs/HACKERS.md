@@ -26,7 +26,7 @@ APEX:
 * ADMIN/secret
 * WS=META/USER=METAARCHIVE/secret
 
-** My archive occupies above 1.3tb of disk space on SATA HD. 10 years (2006-2016), more than 120000 shots taken by DSLRs, Android smatrphones and tablets. Importing the whole archive using 5 threads on 4 core CPU takes ~2 days.**
+My archive occupies above 1.3tb of disk space on SATA HD. 10 years (2006-2016), more than 120000 shots taken by DSLRs, Android smatrphones and tablets. Importing the whole archive using 5 threads on 4 core CPU takes about 2 days.
 
 
 
