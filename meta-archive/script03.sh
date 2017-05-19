@@ -10,7 +10,7 @@ export ORACLE_SID=XE
 
 bzip2 -d < MA.dmp.bz2 > /u01/app/oracle/admin/XE/dpdump/MA.dmp
 
-for file in MA.MA_TAG_NAMES MA.MA_FILES MA.MA_TAGGED_FILES; do
+for file in MA.MA_FILES MA.MA_PATHS; do
 time impdp system/$PASSWORD CONTENT=DATA_ONLY DUMPFILE=MA.dmp TABLES=$file DIRECTORY=DATA_PUMP_DIR LOGFILE=MA.imp.$file.log;
 done
 

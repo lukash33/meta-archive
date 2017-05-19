@@ -148,8 +148,6 @@ my @PropMap = # prop name, db column name, data type: N-number, V-varchar2
 [ "IDENTIFY::type",                  "IM_TYPE",                             'V' ],
 [ "INT::File Type",                  "MA_TYPE",                             'V' ],
 [ "INT::Orientation",                "ORIENTATION_PLS",                     'V' ],
-[ "INT::Directories",                "DIRECTORIES",                         'V' ],
-[ "INT::File Name",                  "FILE_NAME",                           'V' ],
 [ "INT::File Suffix",                "SUFFIX",                              'V' ],
 [ "INT::Address",	                 "ADDRESS",                             'V' ],
 [ "EXIF::GPS Longitude",             "LONGITUDE",                           'V' ],
@@ -246,9 +244,9 @@ sub signature_as_char_string2 {
 
 my $dbh;
 my $sth_find_file_by_path;
+my $sth_find_file_by_md5sum;
 my $sth_new_file;
-my $sth_new_tag_name;
-my $sth_new_file_tag;
+my $sth_new_path;
 
 my $face_detector;
 
@@ -268,11 +266,11 @@ sub init_colors {	# initialize color palette
 sub setup_thread {
 	$face_detector = Image::ObjectDetect->new($cascade);
 	$dbh = DBI->connect("dbi:Oracle:","$opt_connect_string", undef, { PrintError => 1, RaiseError => 1, AutoCommit => 0 } );
-	$sth_find_file_by_path = $dbh->prepare("select count(1) from MA_FILES where path = ?");
-	$sth_new_tag_name = $dbh->prepare("insert into MA_TAG_NAMES (tag_id,tag_name,cdate) values (?,?,sysdate)");
-	$sth_new_file_tag = $dbh->prepare("insert into MA_TAGGED_FILES (file_id,tag_id) values (?,?)");
+	$sth_find_file_by_path = $dbh->prepare("select count(1) from MA_PATHS where path = ?");
+	$sth_find_file_by_md5sum = $dbh->prepare("select file_id from MA_FILES where md5sum = ?");
+	$sth_new_path = $dbh->prepare("insert into MA_PATHS (file_id,path) values (?,?)");
 	# Problem: dates like '2006:02:14 15:41:13+02:00' not fit the 'YYYY:MM:DD HH24:MI:SS' mask
-	$sth_new_file = $dbh->prepare("insert into MA_FILES (file_id,bytes,cluster_id,path,cdate,md5sum,thumb,lpuzzle,taken $PropColumns) values (?,?,?,?,sysdate,?,?,?,to_date(?,'YYYY:MM:DD HH24:MI:SS') $PropBindString)");
+	$sth_new_file = $dbh->prepare("insert into MA_FILES (file_id,bytes,cdate,md5sum,thumb,lpuzzle,taken $PropColumns) values (?,?,sysdate,?,?,?,to_date(?,'YYYY:MM:DD HH24:MI:SS') $PropBindString)");
 	init_colors();
 }
   
@@ -287,6 +285,13 @@ sub path_is_duplicate {
 	my($rv) = $sth_find_file_by_path->fetchrow_array;
 	$sth_find_file_by_path->finish;
 	return($rv>0);
+}
+
+sub find_by_md5sum {
+	$sth_find_file_by_md5sum->execute(@_);
+	my($rv) = $sth_find_file_by_md5sum->fetchrow_array;
+	$sth_find_file_by_md5sum->finish;
+	return($rv);
 }
 
 sub is_url {
@@ -336,205 +341,193 @@ sub import_single_file { # some threads die here when JPG is broken. And parent 
    # my $file_type=`file -b --mime-type '$path'`;
    my $file_type=`file -b '$path'`;
    return if($file_type !~ /image/);
-   dbg(1,"[thread=$$] \tProcessing file '$urlpath' ($directories, $filename, $suffix)...");
-   my $file_id=db_select_single("select MA_SEQ_FILES.NEXTVAL from DUAL");
-   dbg(6,"FILE_ID=$file_id: '$urlpath'");
+   $file_type =~ s/\n//g;
+   dbg(1,"[thread=$$] \tProcessing file '$urlpath'...");
    my $md5sum=md5sum_string($path);
    dbg(6,"MD5SUM=$md5sum");
-
-   # fetch EXIF props:
-   %ImageProps=undef; 	# to construct some INT:: props later from
-   my $exifTool = new Image::ExifTool;
-   $exifTool->Options(Duplicates => 0, CoordFormat => "%+.6f");
-   my $exif=$exifTool->ImageInfo($path);
-   my %exif = $exif;
-   # return 0 if(defined($$exif{"Error"}));
-
-   # add EXIF props:
-   $date_taken="";
-   foreach my $prop_name (sort keys %$exif) {
-   	   my $long_prop_name = $exifTool->GetDescription($prop_name);
-   	   add_prop("EXIF::$long_prop_name",$$exif{"$prop_name"});
-   }
-
-   # form some temp pathnames:
-   my($thumb_path,$preview_path) = ("$opt_tmp/THUMB-$file_id.jpg", "$opt_tmp/PREVIEW-$file_id.jpg");
-
-   # RAW or not?
-   my $is_raw = ($file_type =~ / raw /i);   
-
-   # Fetch street address from Google Maps API:
-   $PropValues{"EXIF::GPS Longitude"} =~ s/^\+//; # google does not like PLUS signs
-   $PropValues{"EXIF::GPS Latitude"}  =~ s/^\+//; # google does not like PLUS signs
-   dbg(4,"GPS coords: ". $PropValues{"EXIF::GPS Longitude"} ."; ".$PropValues{"EXIF::GPS Latitude"});
-   if((abs($PropValues{"EXIF::GPS Longitude"})>0) and (abs($PropValues{"EXIF::GPS Latitude"})>0)) {
-   	   $PropValues{"INT::Address"} = get_street_address($PropValues{"EXIF::GPS Longitude"},$PropValues{"EXIF::GPS Latitude"});
-   	   dbg(4,"Address is ".$PropValues{"INT::Address"});
-   }
-
-   # Fix Orientation:
-   my $orientation = $PropValues{"EXIF::Orientation"};
-   my $rotate;
-   $rotate = "90" if($orientation =~ /90/);
-   $rotate = "180" if($orientation =~ /180/);
-   $rotate = "270" if($orientation =~ /270/);
-   if( ($rotate eq "90") or ($rotate eq "270") ) { # swap width and height: 
-   	   ($PropValues{"EXIF::Image Height"}, $PropValues{"EXIF::Image Width"}) = ($PropValues{"EXIF::Image Width"}, $PropValues{"EXIF::Image Height"});
-   };
-   $rotate = "-rotate $rotate" if(defined($rotate));
-
-   # prepare thumbnail & preview images:
-   if($is_raw) {
-     # better not use --embedded-image here for it is of unknown size and orientation:
-     my_system("ufraw-batch --silent --size=${opt_thumb_size}x${opt_thumb_size} --out-type=jpg --noexif --output=- --wb=camera '$path' > '$thumb_path'");
-     my_system("ufraw-batch --silent --size=${opt_preview_size}x${opt_preview_size} --out-type=jpg --noexif --output=- --wb=camera '$path' > '$preview_path'");
+   my $file_id=find_by_md5sum($md5sum);
+   my $is_binary_duplicate=0;
+   if(length($file_id)) {
+        dbg(6,"FILE '$urlpath' is a binary duplicate");
+        $is_binary_duplicate=1;
    } else {
-     # source images may be too big here:
-     my_system("convert -format jpg $rotate -strip -thumbnail ${opt_thumb_size}x${opt_thumb_size} '$path' jpeg:- > '$thumb_path'");
-     my_system("convert -format jpg $rotate -scale ${opt_preview_size}x${opt_preview_size} '$path' jpeg:- > '$preview_path'");
-   };
+        $file_id=db_select_single("select MA_SEQ_FILES.NEXTVAL from DUAL");
+   }
+   dbg(6,"FILE_ID=$file_id for '$urlpath'");
 
-   unlink($path) if($path_is_url); # remove local temporary copy
-
-   my $thumb=slurp_file($thumb_path); unlink($thumb_path);
-
-   # Fetch major colors. See http://www.imagemagick.org/Usage/compare/#metrics how
-#   my $color_cmd = "convert '$preview_path' -scale ${opt_preview_size}x${opt_preview_size}\\! -colors $opt_colors +dither -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
-#   my $color_cmd = "convert '$preview_path' -scale ${opt_preview_size}x${opt_preview_size} -colors $opt_colors +dither -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
-#   my $color_cmd = "convert '$preview_path' -colors $opt_colors +dither -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
-   my $color_cmd = "convert '$preview_path' -colors $opt_colors -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
-   dbg(4,"Check major colors cmd: $color_cmd");
-   my @colors = split("\n", my $color_out=`$color_cmd`);
-   dbg(4,"Cmd output is:\n$color_out");
-   
-   # fetch avg saturation of the image:
-   my $sat_cmd='identify -quiet -colorspace HSL -format "%[fx:mean.g]" ';
-   my $saturation=`$sat_cmd '$preview_path'` + 0.0;
-   dbg(8,"saturation=$saturation");
-
-   my $total_pixels=0;	# total pixels in the preview of the image
-   my %Pixels;			# number of pixels of a palette color
-
-   foreach(my $c=0; $c<=$#colors; $c++) {
-        my($pixels) = (split(':',$colors[$c]))[0]+0; 
-        $total_pixels += $pixels;
-        $colors[$c] =~ s/^.*hsl.*\(//; 
-        $colors[$c] =~ s/\).*//;
-        my($h,$s,$l)=split(',',$colors[$c]);
-        dbg(6,"Color line [$c] for '$urlpath' is HSL($h,$s,$l)");
-        ($h, $s, $l) = ($h*360/100, $s/100, $l/100);	# normalize
-        my($color,$color_distance) = (lc($opt_color_match) eq "lab") ? NearestColorLAB($h,$s,$l,$saturation) : NearestColorHSL($h,$s,$l,$saturation);
-        next if($color_distance > $opt_color_distance); # too far from palette
-        $Pixels{$color} += $pixels;
+   if(!$is_binary_duplicate) { # populate child first
+          # fetch EXIF props:
+          %ImageProps=undef; 	# to construct some INT:: props later from
+          my $exifTool = new Image::ExifTool;
+          $exifTool->Options(Duplicates => 0, CoordFormat => "%+.6f");
+          my $exif=$exifTool->ImageInfo($path);
+          my %exif = $exif;
+          # return 0 if(defined($$exif{"Error"}));
+    
+          # add EXIF props:
+          $date_taken="";
+          foreach my $prop_name (sort keys %$exif) {
+          	   my $long_prop_name = $exifTool->GetDescription($prop_name);
+          	   add_prop("EXIF::$long_prop_name",$$exif{"$prop_name"});
+          }
+    
+          # form some temp pathnames:
+          my($thumb_path,$preview_path) = ("$opt_tmp/THUMB-$file_id.jpg", "$opt_tmp/PREVIEW-$file_id.jpg");
+    
+          # RAW or not?
+          my $is_raw = ($file_type =~ / raw /i);   
+    
+          # Fetch street address from Google Maps API:
+          $PropValues{"EXIF::GPS Longitude"} =~ s/^\+//; # google does not like PLUS signs
+          $PropValues{"EXIF::GPS Latitude"}  =~ s/^\+//; # google does not like PLUS signs
+          dbg(4,"GPS coords: ". $PropValues{"EXIF::GPS Longitude"} ."; ".$PropValues{"EXIF::GPS Latitude"});
+          if((abs($PropValues{"EXIF::GPS Longitude"})>0) and (abs($PropValues{"EXIF::GPS Latitude"})>0)) {
+          	   $PropValues{"INT::Address"} = get_street_address($PropValues{"EXIF::GPS Longitude"},$PropValues{"EXIF::GPS Latitude"});
+          	   dbg(4,"Address is ".$PropValues{"INT::Address"});
+          }
+    
+          # Fix Orientation:
+          my $orientation = $PropValues{"EXIF::Orientation"};
+          my $rotate;
+          $rotate = "90" if($orientation =~ /90/);
+          $rotate = "180" if($orientation =~ /180/);
+          $rotate = "270" if($orientation =~ /270/);
+          if( ($rotate eq "90") or ($rotate eq "270") ) { # swap width and height: 
+          	   ($PropValues{"EXIF::Image Height"}, $PropValues{"EXIF::Image Width"}) = ($PropValues{"EXIF::Image Width"}, $PropValues{"EXIF::Image Height"});
+          };
+          $rotate = "-rotate $rotate" if(defined($rotate));
+    
+          # prepare thumbnail & preview images:
+          my $quoted_path = $path;
+          $quoted_path =~ s/'/'"'"'/g;
+          if($is_raw) {
+            # better not use --embedded-image here for it is of unknown size and orientation:
+            my_system("ufraw-batch --silent --size=${opt_thumb_size}x${opt_thumb_size} --out-type=jpg --noexif --output=- --wb=camera '$quoted_path' > '$thumb_path'");
+            my_system("ufraw-batch --silent --size=${opt_preview_size}x${opt_preview_size} --out-type=jpg --noexif --output=- --wb=camera '$quoted_path' > '$preview_path'");
+          } else {
+            # source images may be too big here:
+            my_system("convert -format jpg $rotate -strip -thumbnail ${opt_thumb_size}x${opt_thumb_size} '$quoted_path' jpeg:- > '$thumb_path'");
+            my_system("convert -format jpg $rotate -scale ${opt_preview_size}x${opt_preview_size} '$quoted_path' jpeg:- > '$preview_path'");
+          };
+    
+          unlink($path) if($path_is_url); # remove local temporary copy
+    
+          my $thumb=slurp_file($thumb_path); unlink($thumb_path);
+    
+          # Fetch major colors. See http://www.imagemagick.org/Usage/compare/#metrics how
+#   #      my $color_cmd = "convert '$preview_path' -scale ${opt_preview_size}x${opt_preview_size}\\! -colors $opt_colors +dither -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
+#   #      my $color_cmd = "convert '$preview_path' -scale ${opt_preview_size}x${opt_preview_size} -colors $opt_colors +dither -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
+#   #      my $color_cmd = "convert '$preview_path' -colors $opt_colors +dither -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
+          my $color_cmd = "convert '$preview_path' -colors $opt_colors -compress none -depth 8 -format %c  -colorspace HSL histogram:info:- | sort -nr"; 
+          dbg(4,"Check major colors cmd: $color_cmd");
+          my @colors = split("\n", my $color_out=`$color_cmd`);
+          dbg(4,"Cmd output is:\n$color_out");
+          
+          # fetch avg saturation of the image:
+          my $sat_cmd='identify -quiet -colorspace HSL -format "%[fx:mean.g]" ';
+          my $saturation=`$sat_cmd '$preview_path'` + 0.0;
+          dbg(8,"saturation=$saturation");
+    
+          my $total_pixels=0;	# total pixels in the preview of the image
+          my %Pixels;			# number of pixels of a palette color
+    
+          foreach(my $c=0; $c<=$#colors; $c++) {
+               my($pixels) = (split(':',$colors[$c]))[0]+0; 
+               $total_pixels += $pixels;
+               $colors[$c] =~ s/^.*hsl.*\(//; 
+               $colors[$c] =~ s/\).*//;
+               my($h,$s,$l)=split(',',$colors[$c]);
+               dbg(6,"Color line [$c] for '$urlpath' is HSL($h,$s,$l)");
+               ($h, $s, $l) = ($h*360/100, $s/100, $l/100);	# normalize
+               my($color,$color_distance) = (lc($opt_color_match) eq "lab") ? NearestColorLAB($h,$s,$l,$saturation) : NearestColorHSL($h,$s,$l,$saturation);
+               next if($color_distance > $opt_color_distance); # too far from palette
+               $Pixels{$color} += $pixels;
+          }
+          
+          my $nc=0;	# counter. only 2 colors matter;
+          foreach my $cid (sort { $Pixels{$a} <=> $Pixels{$b} } keys %Pixels) {
+          	   next if($Pixels{$cid} < $total_pixels*$opt_color_fraction);       # too few pixels of same color
+          	   next if(++$nc > 2);
+          	   add_prop("INT::Color".$nc, $cid);
+          	   add_prop("INT::ColorDistance".$nc, (100 - ($Pixels{$cid}/$total_pixels)*100));
+          }
+    
+          # fetch some other props:
+          my %Identify; 
+          my $ii=0;
+          dbg(6,"CMD:: identify -quiet -format '$identify_props' '$preview_path'");
+          foreach(split(/::/,`identify -quiet -format '$identify_props' '$preview_path'`)) { 
+          	   my($P,$p);
+          	   s/\n//g;
+          	   $P = $Identify{$p=$identify_props_thumb[$ii++]} = $_; 
+          	   dbg(8,"identify[$p]=$P");
+          };
+    
+          # fill in LIBPUZZLE image fingerprint:
+          my $lpuzzle;
+          my $lpl;
+          eval { $lpuzzle=libpuzzle_string($preview_path); };
+          dbg(6,"LIBPUZZLE($urlpath): $lpuzzle=libpuzzle_string($preview_path)");
+          if(($lpl=length($lpuzzle)) ne $opt_puzzle_len) { # something went wrong, may be broken JPG, etc.
+          	   dbg(1,"Can't LIBPUZZLE '$preview_path'. Length returned=$lpl. Rollback");
+          	   $dbh->rollback;
+          	   return;
+          }
+    
+          # replace database record if needed:
+          if($dupe) { # Just renew record
+              dbg(6,"Updating path '$urlpath'...");
+              $dbh->do("delete from MA_FILES where path=?", undef, $urlpath);
+          }
+    
+          # bind variables and INSERT into MA_FILES:
+          eval {
+          	   $sth_new_file->bind_param(1, $file_id) 		or die $sth_new_file->errstr;
+          	   $sth_new_file->bind_param(2, $bytes) 		or die $sth_new_file->errstr;
+          	   $sth_new_file->bind_param(3, $md5sum) 		or die $sth_new_file->errstr;
+          	   $sth_new_file->bind_param(4, $thumb, { ora_type => ORA_BLOB }) or die $sth_new_file->errstr;
+          	   $sth_new_file->bind_param(5, $lpuzzle) 		or die $sth_new_file->errstr;
+          }; 
+          my($err,$errstr) = ($sth_new_file->err, $sth_new_file->errstr);
+    
+          # add the rest of the props:
+          add_prop('INT::Faces',get_faces($preview_path));		unlink($preview_path);
+          add_prop('INT::Saturation',$saturation);
+          add_prop('INT::File Type',$file_type);
+          add_prop('INT::File Name',$filename);
+          add_prop('INT::Directories',$directories);
+          add_prop('INT::File Suffix',$suffix);
+          add_prop('INT::Orientation', ('Landscape','Square','Portrait')[($PropValues{"EXIF::Image Height"} <=> $PropValues{"EXIF::Image Width"})+1]);
+          # Squares may not be exact but approximate: (width ~ height). Visually they are also squares. We might take it into account somehow here
+    
+          # add even more props:
+          foreach my $prop_name (sort keys %Identify) {
+          	   my $long_prop_name = $exifTool->GetDescription($prop_name);
+          	   add_prop("IDENTIFY::$prop_name",$Identify{"$prop_name"});
+          }
+    
+          # some more fields to bind:
+          eval { $sth_new_file->bind_param(6, $date_taken) or die $sth_new_file->errstr; };
+          
+          # all props ready at %PropValues now
+          # bind the rest of the props and execute INSERT into MA_FILES:
+          eval {
+              foreach(0..$#PropMap) { 
+		 $sth_new_file->bind_param(7+$_, $PropValues{$PropColNames[$_]}) or die $sth_new_file->errstr; 
+              };
+          };
+          
+          eval { $sth_new_file->execute; };
+          my($err,$errstr) = ($sth_new_file->err, $sth_new_file->errstr);
+          
+          $urlpath =~ s/\//\/\//; # mark first file occurence by additionally / at the beginning of PATH to search for // then
    }
    
-   my $nc=0;	# counter. only 2 colors matter;
-   foreach my $cid (sort { $Pixels{$a} <=> $Pixels{$b} } keys %Pixels) {
-   	   next if($Pixels{$cid} < $total_pixels*$opt_color_fraction);       # too few pixels of same color
-   	   next if(++$nc > 2);
-   	   add_prop("INT::Color".$nc, $cid);
-   	   add_prop("INT::ColorDistance".$nc, (100 - ($Pixels{$cid}/$total_pixels)*100));
-   }
-
-   # fetch some other props:
-   my %Identify; 
-   my $ii=0;
-   dbg(6,"CMD:: identify -quiet -format '$identify_props' '$preview_path'");
-   foreach(split(/::/,`identify -quiet -format '$identify_props' '$preview_path'`)) { 
-   	   my($P,$p); 
-   	   $P = $Identify{$p=$identify_props_thumb[$ii++]} = $_; 
-   	   dbg(8,"identify[$p]=$P");
-   };
-
-   # fill in LIBPUZZLE image fingerprint:
-   my $lpuzzle;
-   my $lpl;
-   eval { $lpuzzle=libpuzzle_string($preview_path); };
-   dbg(6,"LIBPUZZLE($urlpath): $lpuzzle=libpuzzle_string($preview_path)");
-   if(($lpl=length($lpuzzle)) ne $opt_puzzle_len) { # something went wrong, may be broken JPG, etc.
-   	   dbg(1,"Can't LIBPUZZLE '$preview_path'. Length returned=$lpl. Rollback");
-   	   $dbh->rollback;
-   	   return;
-   }
-
-   # replace database record if needed:
-   if($dupe) { # Just renew record
-       dbg(6,"Updating path '$urlpath'...");
-       $dbh->do("delete from MA_FILES where path=?", undef, $urlpath);
-   }
-
-   # bind variables and INSERT into MA_FILES:
-   eval {
-   	   $sth_new_file->bind_param(1, $file_id) 		or die $sth_new_file->errstr;
-   	   $sth_new_file->bind_param(2, $bytes) 		or die $sth_new_file->errstr;
-   	   $sth_new_file->bind_param(3, $file_id) 		or die $sth_new_file->errstr;
-   	   $sth_new_file->bind_param(4, $urlpath) 		or die $sth_new_file->errstr;
-   	   $sth_new_file->bind_param(5, $md5sum) 		or die $sth_new_file->errstr;
-   	   $sth_new_file->bind_param(6, $thumb, { ora_type => ORA_BLOB }) or die $sth_new_file->errstr;
-   	   $sth_new_file->bind_param(7, $lpuzzle) 		or die $sth_new_file->errstr;
-   }; 
-   my($err,$errstr) = ($sth_new_file->err, $sth_new_file->errstr);
-
-   # add the rest of the props:
-   add_prop('INT::Faces',get_faces($preview_path));		unlink($preview_path);
-   add_prop('INT::Saturation',$saturation);
-   add_prop('INT::File Type',$file_type);
-   add_prop('INT::File Name',$filename);
-   add_prop('INT::Directories',$directories);
-   add_prop('INT::File Suffix',$suffix);
-   add_prop('INT::Orientation', ('Landscape','Square','Portrait')[($PropValues{"EXIF::Image Height"} <=> $PropValues{"EXIF::Image Width"})+1]);
-   # Squares may not be exact but approximate: (width ~ height). Visually they are also squares. We might take it into account somehow here
-
-   # add even more props:
-   foreach my $prop_name (sort keys %Identify) {
-   	   my $long_prop_name = $exifTool->GetDescription($prop_name);
-   	   add_prop("IDENTIFY::$prop_name",$Identify{"$prop_name"});
-   }
-
-   # some more fields to bind:
-   $sth_new_file->bind_param(8, $date_taken) or die $sth_new_file->errstr;
+   eval { $sth_new_path->execute($file_id,$urlpath); or die $sth_new_path->errstr; };  
+   my($err,$errstr) = ($sth_new_path->err, $sth_new_path->errstr);
    
-   # all props ready at %PropValues now
-   # bind the rest of the props and execute INSERT into MA_FILES:
-   foreach(0..$#PropMap) { 
-		$sth_new_file->bind_param(9+$_, $PropValues{$PropColNames[$_]}) or die $sth_new_file->errstr; 
-   };
-   
-   $sth_new_file->execute;
-
-   ($err,$errstr) = ($sth_new_file->err, $sth_new_file->errstr);
-
-   # Add default file tags:
-   eval {
-   	   add_file_tag($file_id,$urlpath,$ImportTag);  # This must run into UNIQUE constraint violation in some ot the threads
-   };
-
-   dbg(9,"Committing MA_FILE '$urlpath' record...");
+   dbg(9,"Committing '$urlpath' record...");
    $dbh->commit;
-}
-
-my %TagIds;
-
-sub add_file_tag {
-	my($file_id,$path,$tag)=@_;
-	dbg(6,"TAG: '$tag' for file '$path'");
-	my $tag_id;
-	if(!defined($tag_id=$TagIds{$tag})) {
-	   $tag_id=db_select_single("select tag_id from MA_TAG_NAMES where tag_name='$tag'");
-	   if(!$tag_id) { # need new TAG_NAMES record:
-		   $tag_id=db_select_single("select MA_SEQ_TAG.NEXTVAL from DUAL");
-		   $sth_new_tag_name->execute($tag_id,$tag);
-           }
-        } else {
-	   $TagIds{$tag} = $tag_id;
-	}
-        eval {
-     		$sth_new_file_tag->execute($file_id,$tag_id);
-	} or do {
-	     my $err  = $sth_new_file_tag->err;
-	     my $errstr = $sth_new_file_tag->errstr;
-	     dbg(6,"Oracle error inserting TAG '$tag' for file '$path': $errstr");
-        }
 }
 
 my %PropIds;
