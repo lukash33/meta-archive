@@ -1,7 +1,6 @@
 The *MetaArchive* software project is intended to help searching photo in a large
 private digital archive.
 
-* [Live Demo](http://37.139.9.192/apex/f?p=101).
 * [Video demo](https://youtu.be/JMDMsKdvT30)
 
 *MetaArchive* is targeted to lazy experienced photo-amateurs and professionals
